@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Harmonics Builder</title>
+  <!-- Original AoPS interactive. Replaces the third-party "Fourier: Making Waves" simulation. -->
+<script>
+// EigenNode auto-height v2.4
+(function() {
+  // 4px buffer for subpixel rounding + parent's >=3px noise threshold.
+  // Extra 18px when horizontal overflow forces a scrollbar (eats vertical
+  // space inside the iframe — AoPS classroom embeds in a narrower column
+  // than the 600px content, so a horizontal scrollbar appears and steals
+  // ~10-17px of height). Without this, the iframe ends up ~11-15px short.
+  var BUFFER = 4;
+  var H_SCROLLBAR = 18;
+  var measuring = false;
+  function measure() {
+    if (measuring) return 0;
+    var b = document.body, h = document.documentElement;
+    if (!b) return 0;
+    measuring = true;
+    // Temporarily neutralise body's height/min-height (overriding stylesheet
+    // rules with !important) so scrollHeight reflects actual content extent.
+    // Without this, patterns like body { height: 100vh } cause scrollHeight
+    // to echo the iframe's current viewport — adding BUFFER each cycle
+    // ratchets the iframe taller forever. Browser doesn't paint until this
+    // synchronous block returns, so no visible flicker.
+    var hOld = b.style.height, hPri = b.style.getPropertyPriority('height');
+    var mOld = b.style.minHeight, mPri = b.style.getPropertyPriority('min-height');
+    b.style.setProperty('height', 'auto', 'important');
+    b.style.setProperty('min-height', '0', 'important');
+    var content = b.scrollHeight || 0;
+    if (hOld) b.style.setProperty('height', hOld, hPri); else b.style.removeProperty('height');
+    if (mOld) b.style.setProperty('min-height', mOld, mPri); else b.style.removeProperty('min-height');
+    measuring = false;
+    // Check the documentElement only — that's the element that owns the
+    // iframe's horizontal scrollbar. Body can be narrower than the iframe
+    // (e.g. body{width:600px} centered in a 700px iframe) and have its own
+    // 1-2px overflow that doesn't actually trigger a scrollbar.
+    var hOverflow = h && (h.scrollWidth - h.clientWidth) >= 4;
+    return Math.ceil(content) + BUFFER + (hOverflow ? H_SCROLLBAR : 0);
+  }
+  var last = 0;
+  function report() {
+    var h = measure();
+    if (h > 0 && Math.abs(h - last) >= 2) {
+      last = h;
+      window.parent.postMessage({ type: 'resize', height: h }, '*');
+    }
+  }
+  window.addEventListener('load', report);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(report);
+  if (window.ResizeObserver && document.body) new ResizeObserver(report).observe(document.body);
+})();
+</script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 700px; height: 450px; overflow: hidden;
+      background: #f5f5f5;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      user-select: none;
+    }
+    canvas { display: block; touch-action: none; }
+    #bar {
+      height: 50px; display: flex; align-items: center;
+      gap: 14px; padding: 0 14px; font-size: 13px; color: #334;
+    }
+    .seg { display: inline-flex; border: 1px solid #9aa4b2; border-radius: 6px; overflow: hidden; }
+    .seg button {
+      border: none; background: #fff; padding: 5px 13px;
+      font: 13px 'Segoe UI', system-ui, sans-serif; color: #556; cursor: pointer;
+    }
+    .seg button.on { background: #2266ee; color: #fff; }
+    .ctl { display: inline-flex; align-items: center; gap: 7px; }
+    input[type=checkbox] { accent-color: #2266ee; }
+    #btnNew, #btnReset {
+      border: 1px solid #9aa4b2; background: #fff; border-radius: 6px;
+      padding: 5px 12px; font: 13px 'Segoe UI', system-ui, sans-serif;
+      color: #556; cursor: pointer;
+    }
+    #btnReset { margin-left: auto; }
+    #btnNew:hover, #btnReset:hover, .seg button:hover:not(.on) { background: #eef2f8; }
+    #btnNew:disabled { opacity: 0.45; cursor: default; }
+    #btnNew.pulse { border-color: #00aa55; color: #007a3d; animation: pulseBtn 1.2s infinite; }
+    @keyframes pulseBtn {
+      0%   { box-shadow: 0 0 0 0 rgba(0,170,85,0.45); }
+      70%  { box-shadow: 0 0 0 8px rgba(0,170,85,0); }
+      100% { box-shadow: 0 0 0 0 rgba(0,170,85,0); }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c" width="700" height="400"></canvas>
+  <div id="bar">
+    <span class="seg">
+      <button id="bGame">Game</button><button id="bFree">Free play</button>
+    </span>
+    <button id="btnNew">New target</button>
+    <label class="ctl"><input type="checkbox" id="chkParts"> Show harmonics</label>
+    <button id="btnReset" title="Reset">&#8635; Reset</button>
+  </div>
+  <script>
+  (() => {
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    const W = 700, H = 400;
+
+    // ── Layout ───────────────────────────────────────────────────────
+    const PLOT = { x: 14, y: 12, w: 672, h: 224 };       // wave panel
+    const MID = PLOT.y + PLOT.h / 2;                     // 124
+    const AMP_PX = 42;                                   // px per amplitude unit
+    const TX = [110, 230, 350, 470, 590];                // slider track centers
+    const T_TOP = 268, T_BOT = 378;
+    const T_ZERO = (T_TOP + T_BOT) / 2, T_HALF = (T_BOT - T_TOP) / 2;
+    const HCOLORS = ['#e05252', '#e6962e', '#3aa53a', '#2e86d4', '#9b59b6'];
+
+    // ── Target bank ──────────────────────────────────────────────────
+    const TARGETS = [
+      { name: 'Square-ish',   a: [0.80, 0,     0.25, 0,     0.15] },
+      { name: 'Triangle-ish', a: [0.85, 0,    -0.10, 0,     0.05] },
+      { name: 'Sawtooth-ish', a: [0.75, -0.35, 0.25, -0.15, 0.10] },
+      { name: 'Chord: 1 + 2', a: [0.65, 0.45,  0,    0,     0   ] },
+      { name: 'Chord: 2 + 3', a: [0,    0.60,  0.40, 0,     0   ] },
+      { name: 'Chord: 1 + 5', a: [0.70, 0,     0,    0,     0.35] },
+    ];
+
+    // ── URL presets: ?mode=free&target=3&parts=1 ─────────────────────
+    const params = new URLSearchParams(location.search);
+    const tParam = parseInt(params.get('target'), 10);
+    const init = {
+      mode: params.get('mode') === 'free' ? 'free' : 'game',
+      // ?target= is 1-based; without it the first target is random (game only)
+      tIdx: (tParam >= 1 && tParam <= TARGETS.length)
+        ? tParam - 1
+        : Math.floor(Math.random() * TARGETS.length),
+      parts: params.get('parts') === '1',
+    };
+
+    // ── State ────────────────────────────────────────────────────────
+    let mode, tIdx, amps, score, matched, matchT, showParts;
+    let dragIdx = -1, hintDone = false;
+    let lastMx = -100, lastMy = -100;
+    let animT = 0;
+
+    function applyInit() {
+      mode = init.mode; tIdx = init.tIdx;
+      amps = [0, 0, 0, 0, 0];
+      score = 0; matched = false; matchT = -10;
+      showParts = init.parts; hintDone = false;
+      syncControls();
+    }
+
+    // ── Controls ─────────────────────────────────────────────────────
+    const bGame = document.getElementById('bGame');
+    const bFree = document.getElementById('bFree');
+    const btnNew = document.getElementById('btnNew');
+    const chkParts = document.getElementById('chkParts');
+
+    function syncControls() {
+      bGame.classList.toggle('on', mode === 'game');
+      bFree.classList.toggle('on', mode === 'free');
+      btnNew.disabled = mode === 'free';
+      btnNew.classList.toggle('pulse', mode === 'game' && matched);
+      chkParts.checked = showParts;
+    }
+    bGame.addEventListener('click', () => { mode = 'game'; syncControls(); });
+    bFree.addEventListener('click', () => { mode = 'free'; syncControls(); });
+    btnNew.addEventListener('click', () => {
+      if (mode !== 'game') return;
+      let j;
+      do { j = Math.floor(Math.random() * TARGETS.length); } while (j === tIdx);
+      tIdx = j; amps = [0, 0, 0, 0, 0]; matched = false;
+      syncControls();
+    });
+    chkParts.addEventListener('change', () => { showParts = chkParts.checked; });
+    document.getElementById('btnReset').addEventListener('click', applyInit);
+
+    // ── Match scoring (Parseval: coefficient-space distance) ─────────
+    function matchStats() {
+      const t = TARGETS[tIdx].a;
+      let e2 = 0, r2 = 0;
+      for (let n = 0; n < 5; n++) {
+        e2 += (amps[n] - t[n]) * (amps[n] - t[n]);
+        r2 += t[n] * t[n];
+      }
+      const err = Math.sqrt(e2), ref = Math.max(Math.sqrt(r2), 0.5);
+      return { err, pct: Math.max(0, 1 - err / ref), thresh: 0.12 * ref };
+    }
+
+    // ── Drawing helpers ──────────────────────────────────────────────
+    function rrect(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+
+    const K = 2 * Math.PI * 2 / PLOT.w;   // two fundamental periods across plot
+
+    function traceWave(a, phi) {
+      ctx.beginPath();
+      for (let px = 0; px <= PLOT.w; px += 2) {
+        let s = 0;
+        for (let n = 0; n < 5; n++) {
+          if (a[n]) s += a[n] * Math.sin((n + 1) * (K * px - phi));
+        }
+        const y = MID - s * AMP_PX;
+        px === 0 ? ctx.moveTo(PLOT.x + px, y) : ctx.lineTo(PLOT.x + px, y);
+      }
+      ctx.stroke();
+    }
+
+    function drawPlot(phi, stats) {
+      ctx.fillStyle = '#fff';
+      ctx.strokeStyle = 'rgba(0,0,0,0.12)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.rect(PLOT.x, PLOT.y, PLOT.w, PLOT.h);
+      ctx.fill(); ctx.stroke();
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(PLOT.x + 1, PLOT.y + 1, PLOT.w - 2, PLOT.h - 2);
+      ctx.clip();
+
+      // Midline
+      ctx.strokeStyle = 'rgba(0,0,0,0.12)'; ctx.lineWidth = 1;
+      ctx.setLineDash([6, 6]);
+      ctx.beginPath(); ctx.moveTo(PLOT.x, MID); ctx.lineTo(PLOT.x + PLOT.w, MID);
+      ctx.stroke(); ctx.setLineDash([]);
+
+      // Target (faint, thick) — game mode only
+      if (mode === 'game') {
+        ctx.strokeStyle = 'rgba(150,155,170,0.55)';
+        ctx.lineWidth = 5.5; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+        traceWave(TARGETS[tIdx].a, phi);
+      }
+
+      // Individual harmonics
+      if (showParts) {
+        ctx.lineWidth = 1.3; ctx.globalAlpha = 0.45;
+        for (let n = 0; n < 5; n++) {
+          if (!amps[n]) continue;
+          ctx.strokeStyle = HCOLORS[n];
+          const solo = [0, 0, 0, 0, 0]; solo[n] = amps[n];
+          traceWave(solo, phi);
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      // Student's sum
+      ctx.save();
+      if (mode === 'game' && matched) { ctx.shadowColor = '#00aa55'; ctx.shadowBlur = 10; }
+      ctx.strokeStyle = '#00aa55'; ctx.lineWidth = 2.5; ctx.lineJoin = 'round';
+      traceWave(amps, phi);
+      ctx.restore();
+
+      // Starburst flourish on a fresh match
+      const p = (animT - matchT) / 0.9;
+      if (mode === 'game' && p >= 0 && p < 1) {
+        ctx.strokeStyle = '#f0a500'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+        ctx.globalAlpha = 1 - p;
+        for (let i = 0; i < 12; i++) {
+          const a = i * Math.PI / 6 + 0.26;
+          const r0 = 26 + 95 * p, r1 = r0 + 16;
+          ctx.beginPath();
+          ctx.moveTo(350 + r0 * Math.cos(a), MID + r0 * Math.sin(a));
+          ctx.lineTo(350 + r1 * Math.cos(a), MID + r1 * Math.sin(a));
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
+      ctx.restore(); // end plot clip
+
+      // ── Plot overlays ──
+      ctx.textAlign = 'left'; ctx.font = '12px Segoe UI'; ctx.fillStyle = '#556';
+      if (mode === 'game') {
+        ctx.fillText('Target: ', PLOT.x + 10, 30);
+        ctx.font = 'bold 12px Segoe UI'; ctx.fillStyle = '#334';
+        ctx.fillText(TARGETS[tIdx].name, PLOT.x + 55, 30);
+
+        ctx.font = 'bold 12px Segoe UI'; ctx.fillStyle = '#556';
+        ctx.fillText('Score: ' + score, PLOT.x + 10, PLOT.y + PLOT.h - 10);
+
+        // Match meter
+        const mb = { x: 496, y: 20, w: 120, h: 9 };
+        ctx.font = '11px Segoe UI'; ctx.fillStyle = '#778899'; ctx.textAlign = 'right';
+        ctx.fillText('Match', mb.x - 6, mb.y + 8);
+        ctx.fillStyle = 'rgba(0,0,0,0.08)'; ctx.fillRect(mb.x, mb.y, mb.w, mb.h);
+        ctx.fillStyle = 'hsl(' + Math.round(120 * stats.pct) + ',65%,42%)';
+        ctx.fillRect(mb.x, mb.y, mb.w * stats.pct, mb.h);
+        ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.lineWidth = 1;
+        ctx.strokeRect(mb.x, mb.y, mb.w, mb.h);
+        ctx.fillStyle = '#556'; ctx.font = 'bold 11px Segoe UI'; ctx.textAlign = 'left';
+        ctx.fillText(Math.round(stats.pct * 100) + '%', mb.x + mb.w + 7, mb.y + 8);
+
+        if (matched) {
+          ctx.fillStyle = '#00aa55'; ctx.font = 'bold 14px Segoe UI';
+          ctx.textAlign = 'center';
+          ctx.fillText('Matched!  Press “New target”', 330, 32);
+        } else if (!hintDone) {
+          ctx.fillStyle = '#aabbcc'; ctx.font = '11px Segoe UI'; ctx.textAlign = 'center';
+          ctx.fillText('Drag the sliders to match the gray wave', 350, PLOT.y + PLOT.h - 10);
+        }
+      } else {
+        ctx.font = 'bold 12px Segoe UI'; ctx.fillStyle = '#556';
+        ctx.fillText('Free play', PLOT.x + 10, 30);
+        if (!hintDone) {
+          ctx.fillStyle = '#aabbcc'; ctx.font = '11px Segoe UI'; ctx.textAlign = 'center';
+          ctx.fillText('Mix harmonics 1–5 to build your own wave', 350, PLOT.y + PLOT.h - 10);
+        }
+      }
+    }
+
+    function drawSliders() {
+      ctx.fillStyle = '#8895a3'; ctx.font = '11px Segoe UI'; ctx.textAlign = 'center';
+      ctx.fillText('Harmonic amplitudes', 350, 256);
+
+      // Scale labels beside the first track
+      ctx.font = '9px Segoe UI'; ctx.fillStyle = '#99a3ae'; ctx.textAlign = 'right';
+      ctx.fillText('+1', TX[0] - 22, T_TOP + 4);
+      ctx.fillText('0', TX[0] - 22, T_ZERO + 3);
+      ctx.fillText('−1', TX[0] - 22, T_BOT + 3);
+
+      for (let i = 0; i < 5; i++) {
+        const tx = TX[i], col = HCOLORS[i];
+        // Track slot
+        rrect(tx - 3, T_TOP, 6, T_BOT - T_TOP, 3);
+        ctx.fillStyle = '#dfe3ea'; ctx.fill();
+        ctx.strokeStyle = '#c5cad4'; ctx.lineWidth = 1; ctx.stroke();
+        // Zero tick
+        ctx.strokeStyle = '#aab2bd'; ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(tx - 12, T_ZERO); ctx.lineTo(tx + 12, T_ZERO);
+        ctx.stroke();
+        // Knob (with harmonic number inside)
+        const ky = T_ZERO - amps[i] * T_HALF;
+        const hot = dragIdx === i ||
+          (Math.abs(lastMx - tx) < 20 && lastMy > T_TOP - 12 && lastMy < T_BOT + 12);
+        ctx.save();
+        if (hot) { ctx.shadowColor = col; ctx.shadowBlur = 12; }
+        rrect(tx - 14, ky - 9, 28, 18, 5);
+        ctx.fillStyle = col; ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 1; ctx.stroke();
+        ctx.restore();
+        ctx.fillStyle = '#fff'; ctx.font = 'bold 11px Segoe UI'; ctx.textAlign = 'center';
+        ctx.fillText(i + 1, tx, ky + 4);
+        // Value
+        const v = amps[i];
+        ctx.fillStyle = col; ctx.font = 'bold 11px Segoe UI';
+        ctx.fillText(v === 0 ? '0.00' : (v < 0 ? '−' : '+') + Math.abs(v).toFixed(2), tx, 396);
+      }
+    }
+
+    // ── Main draw ────────────────────────────────────────────────────
+    function draw() {
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = '#f5f5f5'; ctx.fillRect(0, 0, W, H);
+
+      const phi = 0.6 * animT;
+      const stats = matchStats();
+
+      // Match detection (once per target, game mode)
+      if (mode === 'game' && !matched && stats.err <= stats.thresh) {
+        matched = true; matchT = animT; score++;
+        syncControls();
+      }
+
+      drawPlot(phi, stats);
+      drawSliders();
+    }
+
+    // ── Animation loop ───────────────────────────────────────────────
+    let lastTs = null;
+    function frame(ts) {
+      if (!lastTs) lastTs = ts;
+      const dt = Math.min((ts - lastTs) / 1000, 0.05);
+      lastTs = ts; animT += dt;
+      draw();
+      requestAnimationFrame(frame);
+    }
+
+    // ── Interaction (pointer events: mouse + touch) ──────────────────
+    const cpos = e => {
+      const r = canvas.getBoundingClientRect();
+      return [e.clientX - r.left, e.clientY - r.top];
+    };
+    const quant = v => Math.max(-1, Math.min(1, Math.round(v * 20) / 20));
+    function setFromY(i, my) {
+      amps[i] = quant((T_ZERO - my) / T_HALF);
+      hintDone = true;
+    }
+    canvas.addEventListener('pointerdown', e => {
+      const [mx, my] = cpos(e);
+      for (let i = 0; i < 5; i++) {
+        if (Math.abs(mx - TX[i]) < 20 && my > T_TOP - 12 && my < T_BOT + 12) {
+          dragIdx = i;
+          setFromY(i, my);
+          canvas.setPointerCapture(e.pointerId);
+          break;
+        }
+      }
+    });
+    canvas.addEventListener('pointermove', e => {
+      const [mx, my] = cpos(e);
+      lastMx = mx; lastMy = my;
+      if (dragIdx >= 0) {
+        setFromY(dragIdx, my);
+        canvas.style.cursor = 'grabbing';
+      } else {
+        const over = TX.some((tx, i) =>
+          Math.abs(mx - tx) < 20 && my > T_TOP - 12 && my < T_BOT + 12);
+        canvas.style.cursor = over ? 'grab' : 'default';
+      }
+    });
+    const endDrag = () => { dragIdx = -1; };
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+    canvas.addEventListener('pointerleave', () => { lastMx = -100; lastMy = -100; });
+
+    applyInit();
+    requestAnimationFrame(frame);
+  })();
+  </script>
+</body>
+</html>

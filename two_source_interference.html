@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Two-Speaker Interference</title>
+  <!-- Original AoPS interactive. Replaces the third-party "Wave Interference" simulation. -->
+<script>
+// EigenNode auto-height v2.4
+(function() {
+  // 4px buffer for subpixel rounding + parent's >=3px noise threshold.
+  // Extra 18px when horizontal overflow forces a scrollbar (eats vertical
+  // space inside the iframe — AoPS classroom embeds in a narrower column
+  // than the 600px content, so a horizontal scrollbar appears and steals
+  // ~10-17px of height). Without this, the iframe ends up ~11-15px short.
+  var BUFFER = 4;
+  var H_SCROLLBAR = 18;
+  var measuring = false;
+  function measure() {
+    if (measuring) return 0;
+    var b = document.body, h = document.documentElement;
+    if (!b) return 0;
+    measuring = true;
+    // Temporarily neutralise body's height/min-height (overriding stylesheet
+    // rules with !important) so scrollHeight reflects actual content extent.
+    // Without this, patterns like body { height: 100vh } cause scrollHeight
+    // to echo the iframe's current viewport — adding BUFFER each cycle
+    // ratchets the iframe taller forever. Browser doesn't paint until this
+    // synchronous block returns, so no visible flicker.
+    var hOld = b.style.height, hPri = b.style.getPropertyPriority('height');
+    var mOld = b.style.minHeight, mPri = b.style.getPropertyPriority('min-height');
+    b.style.setProperty('height', 'auto', 'important');
+    b.style.setProperty('min-height', '0', 'important');
+    var content = b.scrollHeight || 0;
+    if (hOld) b.style.setProperty('height', hOld, hPri); else b.style.removeProperty('height');
+    if (mOld) b.style.setProperty('min-height', mOld, mPri); else b.style.removeProperty('min-height');
+    measuring = false;
+    // Check the documentElement only — that's the element that owns the
+    // iframe's horizontal scrollbar. Body can be narrower than the iframe
+    // (e.g. body{width:600px} centered in a 700px iframe) and have its own
+    // 1-2px overflow that doesn't actually trigger a scrollbar.
+    var hOverflow = h && (h.scrollWidth - h.clientWidth) >= 4;
+    return Math.ceil(content) + BUFFER + (hOverflow ? H_SCROLLBAR : 0);
+  }
+  var last = 0;
+  function report() {
+    var h = measure();
+    if (h > 0 && Math.abs(h - last) >= 2) {
+      last = h;
+      window.parent.postMessage({ type: 'resize', height: h }, '*');
+    }
+  }
+  window.addEventListener('load', report);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(report);
+  if (window.ResizeObserver && document.body) new ResizeObserver(report).observe(document.body);
+})();
+</script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 700px; height: 500px; overflow: hidden;
+      background: #f5f5f5;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      user-select: none;
+    }
+    canvas { display: block; touch-action: none; }
+    #controls {
+      height: 60px; padding: 0 10px;
+      display: flex; align-items: center; gap: 8px;
+      font-size: 12px; color: #334;
+    }
+    button {
+      font-family: inherit; font-size: 12px; color: #334;
+      background: #fff; border: 1px solid #b8c2cf; border-radius: 5px;
+      padding: 4px 9px; cursor: pointer; white-space: nowrap;
+    }
+    button.on { background: #dbe7fa; border-color: #7b9fd4; }
+    button:active { background: #cdd9ec; }
+    .sep { width: 1px; height: 30px; background: #ccd4dd; margin: 0 2px; }
+    .lbl { color: #556; white-space: nowrap; }
+    .val { color: #223; font-weight: 600; min-width: 52px; }
+    input[type=range] { width: 92px; accent-color: #5b84c4; }
+    .spacer { flex: 1; }
+  </style>
+</head>
+<body>
+  <canvas id="c" width="700" height="440"></canvas>
+  <div id="controls">
+    <span class="lbl">frequency</span>
+    <input type="range" id="freq" min="100" max="500" step="10" value="200">
+    <span class="val" id="freqVal">200 Hz</span>
+    <span class="lbl">separation</span>
+    <input type="range" id="sepr" min="0.5" max="4" step="0.1" value="2">
+    <span class="val" id="sepVal">2.0 m</span>
+    <span class="sep"></span>
+    <button id="mapBtn">Intensity map</button>
+    <button id="pauseBtn">&#10074;&#10074; Pause</button>
+    <span class="spacer"></span>
+    <button id="resetBtn" title="Reset">&#8634; Reset</button>
+  </div>
+  <script>
+  (() => {
+    'use strict';
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    const W = 700, H = 440;
+
+    // ── Physical model ──────────────────────────────────────
+    // A 14 m x 8.8 m room at 50 px/m; sound speed 343 m/s. Two in-phase
+    // speakers on the left wall; what you see is the pressure field, slowed
+    // ~150x so the wavefronts crawl instead of blurring.
+    const PXM = 50;                 // px per meter
+    const C_SOUND = 343;            // m/s
+    const SLOW = 1 / 150;           // time-scale for the animation
+    const SRC_X = 1.2;              // speaker x, m from the left wall
+    const MID_Y = H / 2 / PXM;      // room mid-height, m
+    const BLK = 2;                  // field resolution: 2x2 px blocks
+    const GW = W / BLK, GH = H / BLK;
+    const F_MIN = 100, F_MAX = 500, D_MIN = 0.5, D_MAX = 4;
+
+    // ── URL params: ?freq=<Hz>&sep=<m>&map=1&paused=1 ───────
+    const qp = new URLSearchParams(location.search);
+    const num = (k, dflt, lo, hi) => {
+      const v = parseFloat(qp.get(k));
+      return Math.min(hi, Math.max(lo, isNaN(v) ? dflt : v));
+    };
+    const init = {
+      freq: num('freq', 200, F_MIN, F_MAX),
+      sep: num('sep', 2.0, D_MIN, D_MAX),
+      map: qp.get('map') === '1',
+      paused: qp.get('paused') === '1',
+    };
+
+    // ── State ───────────────────────────────────────────────
+    let freq, sepM, mapOn, running, tSim = 0;
+    let dragging = false;
+
+    const freqEl = document.getElementById('freq');
+    const sepEl = document.getElementById('sepr');
+    const freqVal = document.getElementById('freqVal');
+    const sepVal = document.getElementById('sepVal');
+    const mapBtn = document.getElementById('mapBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+
+    // ── Field tables ────────────────────────────────────────
+    // Per-cell distance to each source (recomputed when sep changes) and
+    // per-cell phase k*r (recomputed when freq or sep changes).
+    const r1 = new Float32Array(GW * GH), r2 = new Float32Array(GW * GH);
+    const p1 = new Float32Array(GW * GH), p2 = new Float32Array(GW * GH);
+    const a1 = new Float32Array(GW * GH), a2 = new Float32Array(GW * GH);
+    const TN = 4096, TMASK = TN - 1;
+    const SIN = new Float32Array(TN);
+    for (let i = 0; i < TN; i++) SIN[i] = Math.sin(i * 2 * Math.PI / TN);
+    const PH = TN / (2 * Math.PI);  // rad -> table index
+
+    const srcY = () => [MID_Y - sepM / 2, MID_Y + sepM / 2];
+
+    function rebuildGeom() {
+      const [y1, y2] = srcY();
+      for (let gy = 0; gy < GH; gy++) {
+        const y = (gy * BLK + BLK / 2) / PXM;
+        for (let gx = 0; gx < GW; gx++) {
+          const x = (gx * BLK + BLK / 2) / PXM;
+          const i = gy * GW + gx;
+          const dx = x - SRC_X;
+          const d1 = Math.hypot(dx, y - y1), d2 = Math.hypot(dx, y - y2);
+          r1[i] = d1; r2[i] = d2;
+          a1[i] = 1 / Math.sqrt(Math.max(d1, 0.35));
+          a2[i] = 1 / Math.sqrt(Math.max(d2, 0.35));
+        }
+      }
+      rebuildPhase();
+    }
+    function rebuildPhase() {
+      const k = 2 * Math.PI * freq / C_SOUND;     // rad/m
+      for (let i = 0; i < r1.length; i++) {
+        p1[i] = (k * r1[i] * PH) % TN;
+        p2[i] = (k * r2[i] * PH) % TN;
+      }
+    }
+
+    // ── Field rendering (into an offscreen block-grid canvas) ──
+    const off = document.createElement('canvas');
+    off.width = GW; off.height = GH;
+    const octx = off.getContext('2d');
+    const img = octx.createImageData(GW, GH);
+    const px = img.data;
+
+    // ripple palette: trough navy -> rest mid-blue -> crest pale
+    function ripplePixel(i, u) {           // u in [-1, 1]
+      const t = 0.5 + 0.5 * Math.max(-1, Math.min(1, u));
+      px[i * 4] = 14 + 192 * t;
+      px[i * 4 + 1] = 38 + 192 * t;
+      px[i * 4 + 2] = 86 + 169 * t;
+      px[i * 4 + 3] = 255;
+    }
+    // intensity palette: quiet deep navy -> loud yellow (through warm red)
+    function heatPixel(i, t) {             // t in [0, 1]
+      let r, g, b;
+      if (t < 0.5) {
+        const s = t / 0.5;
+        r = 12 + 178 * s; g = 14 + 52 * s; b = 48 + 22 * s;     // navy -> red
+      } else {
+        const s = (t - 0.5) / 0.5;
+        r = 190 + 65 * s; g = 66 + 154 * s; b = 70 - 10 * s;    // red -> yellow
+      }
+      px[i * 4] = r; px[i * 4 + 1] = g; px[i * 4 + 2] = b; px[i * 4 + 3] = 255;
+    }
+
+    function renderField() {
+      const wt = ((2 * Math.PI * freq * tSim * PH) % TN + TN) % TN;
+      if (mapOn) {
+        // time-averaged amplitude (analytic): |a1 e^{ik r1} + a2 e^{ik r2}|,
+        // locally normalized by (a1+a2) so the loud/quiet bands stay crisp
+        // across the whole room.
+        const QT = TN / 4;
+        for (let i = 0; i < p1.length; i++) {
+          const c1 = SIN[(p1[i] + QT) & TMASK], s1 = SIN[p1[i] & TMASK];
+          const c2 = SIN[(p2[i] + QT) & TMASK], s2 = SIN[p2[i] & TMASK];
+          const re = a1[i] * c1 + a2[i] * c2, im = a1[i] * s1 + a2[i] * s2;
+          heatPixel(i, Math.hypot(re, im) / (a1[i] + a2[i]));
+        }
+      } else {
+        for (let i = 0; i < p1.length; i++) {
+          const u = (a1[i] * SIN[(p1[i] - wt + TN) & TMASK]
+                   + a2[i] * SIN[(p2[i] - wt + TN) & TMASK]) / (a1[i] + a2[i]);
+          ripplePixel(i, u);
+        }
+      }
+      octx.putImageData(img, 0, 0);
+    }
+
+    // ── Scene drawing ───────────────────────────────────────
+    function drawSpeaker(sx, sy) {
+      ctx.save();
+      ctx.translate(sx, sy);
+      // cabinet
+      ctx.beginPath();
+      const w = 26, h = 34, r = 4;
+      ctx.moveTo(-w / 2 + r, -h / 2);
+      ctx.arcTo(w / 2, -h / 2, w / 2, h / 2, r);
+      ctx.arcTo(w / 2, h / 2, -w / 2, h / 2, r);
+      ctx.arcTo(-w / 2, h / 2, -w / 2, -h / 2, r);
+      ctx.arcTo(-w / 2, -h / 2, w / 2, -h / 2, r);
+      ctx.closePath();
+      ctx.fillStyle = '#2d3340'; ctx.fill();
+      ctx.strokeStyle = '#aeb6c2'; ctx.lineWidth = 1.5; ctx.stroke();
+      // cone (faces right, into the room)
+      ctx.beginPath(); ctx.arc(4, 0, 9, 0, Math.PI * 2);
+      ctx.fillStyle = '#59617a'; ctx.fill();
+      ctx.beginPath(); ctx.arc(4, 0, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = '#8d96ad'; ctx.fill();
+      ctx.beginPath(); ctx.arc(4, -11, 2.6, 0, Math.PI * 2);
+      ctx.fillStyle = '#59617a'; ctx.fill();
+      ctx.restore();
+    }
+
+    function draw() {
+      renderField();
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(off, 0, 0, W, H);
+
+      const [y1, y2] = srcY();
+      drawSpeaker(SRC_X * PXM, y1 * PXM);
+      drawSpeaker(SRC_X * PXM, y2 * PXM);
+
+      // titles / readouts
+      ctx.fillStyle = 'rgba(255,255,255,0.92)';
+      ctx.font = 'bold 14px Segoe UI'; ctx.textAlign = 'left';
+      ctx.fillText('Two-Speaker Interference', 12, 22);
+      const lam = C_SOUND / freq;
+      ctx.font = '12px Segoe UI'; ctx.textAlign = 'right';
+      ctx.fillText(`f = ${freq} Hz    λ = ${lam.toFixed(2)} m    d = ${sepM.toFixed(1)} m`, W - 12, 22);
+      ctx.textAlign = 'center';
+      if (mapOn) {
+        // legend
+        const lx = W - 152, ly = H - 34, lw = 120, lh = 10;
+        for (let i = 0; i < lw; i++) {
+          const t = i / (lw - 1);
+          let r, g, b;
+          if (t < 0.5) { const s = t / 0.5; r = 12 + 178 * s; g = 14 + 52 * s; b = 48 + 22 * s; }
+          else { const s = (t - 0.5) / 0.5; r = 190 + 65 * s; g = 66 + 154 * s; b = 70 - 10 * s; }
+          ctx.fillStyle = `rgb(${r | 0},${g | 0},${b | 0})`;
+          ctx.fillRect(lx + i, ly, 1.5, lh);
+        }
+        ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1;
+        ctx.strokeRect(lx - 0.5, ly - 0.5, lw + 1, lh + 1);
+        ctx.fillStyle = 'rgba(255,255,255,0.92)'; ctx.font = '11px Segoe UI';
+        ctx.fillText('quiet', lx + 14, ly + 23);
+        ctx.fillText('loud', lx + lw - 12, ly + 23);
+        ctx.fillText('time-averaged loudness', lx + lw / 2, ly - 6);
+      } else {
+        ctx.fillStyle = 'rgba(255,255,255,0.75)'; ctx.font = '11px Segoe UI';
+        ctx.textAlign = 'left';
+        ctx.fillText('sound slowed ~150×', 12, H - 10);
+      }
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(255,255,255,0.8)'; ctx.font = '11.5px Segoe UI';
+      ctx.fillText('Drag a speaker ↕ to change the separation', W / 2, H - 10);
+    }
+
+    // ── UI plumbing ─────────────────────────────────────────
+    function syncLabels() {
+      freqVal.textContent = `${freq} Hz`;
+      sepVal.textContent = `${sepM.toFixed(1)} m`;
+      mapBtn.classList.toggle('on', mapOn);
+      pauseBtn.innerHTML = running ? '&#10074;&#10074; Pause' : '&#9654; Resume';
+    }
+    function applyInit() {
+      freq = Math.round(init.freq / 10) * 10;
+      sepM = init.sep;
+      mapOn = init.map;
+      running = !init.paused;
+      tSim = 0;
+      freqEl.value = freq;
+      sepEl.value = sepM;
+      rebuildGeom();
+      syncLabels();
+    }
+    freqEl.addEventListener('input', () => {
+      freq = parseFloat(freqEl.value);
+      rebuildPhase(); syncLabels();
+    });
+    sepEl.addEventListener('input', () => {
+      sepM = parseFloat(sepEl.value);
+      rebuildGeom(); syncLabels();
+    });
+    mapBtn.addEventListener('click', () => { mapOn = !mapOn; syncLabels(); });
+    pauseBtn.addEventListener('click', () => { running = !running; syncLabels(); });
+    document.getElementById('resetBtn').addEventListener('click', applyInit);
+
+    // drag a speaker vertically to set the separation
+    const cpos = e => {
+      const r = canvas.getBoundingClientRect();
+      return [e.clientX - r.left, e.clientY - r.top];
+    };
+    const overSpeaker = (x, y) => {
+      const [y1, y2] = srcY();
+      return Math.abs(x - SRC_X * PXM) < 22 &&
+             (Math.abs(y - y1 * PXM) < 26 || Math.abs(y - y2 * PXM) < 26);
+    };
+    canvas.addEventListener('pointerdown', e => {
+      const [x, y] = cpos(e);
+      if (overSpeaker(x, y)) {
+        dragging = true;
+        canvas.setPointerCapture(e.pointerId);
+      }
+    });
+    canvas.addEventListener('pointermove', e => {
+      const [x, y] = cpos(e);
+      if (dragging) {
+        const d = 2 * Math.abs(y / PXM - MID_Y);
+        sepM = Math.round(Math.min(D_MAX, Math.max(D_MIN, d)) * 10) / 10;
+        sepEl.value = sepM;
+        rebuildGeom(); syncLabels();
+      }
+      canvas.style.cursor = (dragging || overSpeaker(x, y)) ? 'ns-resize' : 'default';
+    });
+    const endDrag = () => { dragging = false; };
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+
+    // ── Main loop ───────────────────────────────────────────
+    let lastTs = null;
+    function frameLoop(ts) {
+      if (lastTs === null) lastTs = ts;
+      const dt = Math.min((ts - lastTs) / 1000, 0.05);
+      lastTs = ts;
+      if (running) tSim += dt * SLOW;
+      draw();
+      requestAnimationFrame(frameLoop);
+    }
+    applyInit();
+    requestAnimationFrame(frameLoop);
+  })();
+  </script>
+</body>
+</html>
